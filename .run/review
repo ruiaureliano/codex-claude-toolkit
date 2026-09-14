@@ -1,0 +1,1732 @@
+#!/bin/bash
+
+# Resolve paths from the script location so it works from any directory.
+REPOSITORY_PATH="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Load trusted, project-local configuration.
+REVIEW_CONFIG_PATH="$REPOSITORY_PATH/.run/.review.conf"
+if [ ! -f "$REVIEW_CONFIG_PATH" ]; then
+	printf '\033[31mError: review configuration file is missing.\033[0m\n' >&2
+	printf '\033[31mExpected: %s\033[0m\n' "$REVIEW_CONFIG_PATH" >&2
+	printf '\033[33mCreate .run/.review.conf or copy it from another configured project.\033[0m\n' >&2
+	exit 1
+fi
+
+# shellcheck disable=SC1090
+source "$REVIEW_CONFIG_PATH"
+
+# Keep the interactive review screen clean when running in a terminal.
+if [ -t 1 ]; then
+	clear
+fi
+
+# Use colors only for interactive terminal output.
+if [ -t 1 ]; then
+	RESET="$(printf '\033[0m')"
+	BOLD="$(printf '\033[1m')"
+	GREEN="$(printf '\033[32m')"
+	YELLOW="$(printf '\033[33m')"
+	RED="$(printf '\033[31m')"
+else
+	RESET=""
+	BOLD=""
+	GREEN=""
+	YELLOW=""
+	RED=""
+fi
+
+# Track temporary files so every exit path can clean them up.
+TEMP_FILES=()
+
+register_temp_file() {
+	TEMP_FILES+=("$1")
+}
+
+cleanup_temp_files() {
+	local temporary_file
+
+	for temporary_file in "${TEMP_FILES[@]}"; do
+		if [ -n "$temporary_file" ]; then
+			rm -f -- "$temporary_file"
+		fi
+	done
+
+	TEMP_FILES=()
+}
+
+trap cleanup_temp_files EXIT
+trap 'exit 130' HUP INT TERM
+
+# Intentional accepted risk: the workflow uses the official vendor installer
+# commands below as requested. Do not report these exact commands as defects.
+# Both independent reviewers are required before final synthesis.
+ensure_dual_reviewers() {
+	local reviewers_ready=0
+
+	if ! command -v codex >/dev/null 2>&1; then
+		printf '%sCodex CLI is missing.%s\n' "$RED" "$RESET" >&2
+		# Intentional: use the official installer command requested for this workflow.
+		printf '%sInstall it with: curl -fsSL https://chatgpt.com/codex/install.sh | sh%s\n' "$YELLOW" "$RESET" >&2
+		reviewers_ready=1
+	fi
+
+	if ! command -v claude >/dev/null 2>&1; then
+		printf '%sClaude Code CLI is missing.%s\n' "$RED" "$RESET" >&2
+		# Intentional: use the official installer command requested for this workflow.
+		printf '%sInstall it with: curl -fsSL https://claude.ai/install.sh | bash%s\n' "$YELLOW" "$RESET" >&2
+		reviewers_ready=1
+	fi
+
+	return "$reviewers_ready"
+}
+
+# Wait for a reviewer process and stop it if it exceeds the configured timeout.
+wait_for_process() {
+	local process_id="$1"
+	local timeout_seconds="$2"
+	local elapsed_seconds=0
+
+	while kill -0 "$process_id" 2>/dev/null; do
+		if [ "$elapsed_seconds" -ge "$timeout_seconds" ]; then
+			kill "$process_id" 2>/dev/null || true
+			sleep 1
+			kill -9 "$process_id" 2>/dev/null || true
+			wait "$process_id" 2>/dev/null || true
+			return 124
+		fi
+
+		sleep 1
+		elapsed_seconds=$((elapsed_seconds + 1))
+	done
+
+	wait "$process_id"
+}
+
+# Print the changed files and keep their paths for optional SwiftLint validation.
+show_changed_files() {
+	local changed_file
+	local status_code
+	local file_path
+	local status_icon
+	local status_color
+	local file_count
+	local changed_index
+	local changed_status_codes=()
+
+	if ! cd "$REPOSITORY_PATH"; then
+		printf '%sUnable to access the repository.%s\n' "$RED" "$RESET" >&2
+		return 1
+	fi
+
+	if [ ! -e "$GIT_PATH" ]; then
+		printf '%sGit metadata was not found at %s.%s\n' "$RED" "$GIT_PATH" "$RESET" >&2
+		return 1
+	fi
+
+	changed_files="$(git status --short)" || {
+		printf '%sUnable to read Git status.%s\n' "$RED" "$RESET" >&2
+		return 1
+	}
+
+	if [ -z "$changed_files" ]; then
+		printf '%sNo Git changes found.%s\n' "$YELLOW" "$RESET"
+		return 0
+	fi
+
+	review_paths=()
+
+	# Use NUL-delimited Git output so spaces, quotes, and special characters in
+	# file names are preserved. Renames include a second path, which is skipped
+	# because the first path is the current path to review.
+	while IFS= read -r -d '' changed_file; do
+		status_code="${changed_file:0:2}"
+		file_path="${changed_file:3}"
+		review_paths+=("$file_path")
+		changed_status_codes+=("$status_code")
+
+		case "$status_code" in
+		*R* | *C*)
+			IFS= read -r -d '' _ || true
+			;;
+		esac
+
+	done < <(git status --porcelain=v1 -z --untracked-files=all)
+
+	file_count="${#review_paths[@]}"
+	printf '%s☑ %s changed files%s\n\n' "$BOLD" "$file_count" "$RESET"
+
+	for changed_index in "${!review_paths[@]}"; do
+		file_path="${review_paths[$changed_index]}"
+		status_code="${changed_status_codes[$changed_index]}"
+
+		# Map Git status codes to the compact icons used in the file list.
+		case "$status_code" in
+		'??' | *A*)
+			status_icon='+'
+			status_color="$GREEN"
+			;;
+		*D*)
+			status_icon='×'
+			status_color="$RED"
+			;;
+		*M*)
+			status_icon='•'
+			status_color="$YELLOW"
+			;;
+		*)
+			status_icon='•'
+			status_color="$YELLOW"
+			;;
+		esac
+
+		printf '%s%s %s%s\n' "$status_color" "$status_icon" "$file_path" "$RESET"
+	done
+}
+
+# List Swift files using ripgrep when available, with find as a portable fallback.
+list_swift_files() {
+	local search_path="$1"
+
+	if command -v rg >/dev/null 2>&1; then
+		rg --files "$search_path" -g '*.swift'
+	else
+		find "$search_path" -type f -name '*.swift' -print
+	fi
+}
+
+# Ask whether SwiftLint should run, using the same arrow-key menu as the scope menu.
+ask_validation() {
+	local validation_selected="${2:-0}"
+	local validation_prompt="${1:-Run SwiftLint validation?}"
+	local validation_yes
+	local validation_no
+	local key
+	local key_suffix
+
+	draw_validation_menu() {
+		if [ "$validation_selected" -eq 0 ]; then
+			validation_yes="${GREEN}❯ Yes${RESET}"
+			validation_no="  No"
+		else
+			validation_yes="  Yes"
+			validation_no="${GREEN}❯ No${RESET}"
+		fi
+
+		printf '\033[2K\r%s%s%s\n' "$BOLD" "$validation_yes" "$RESET"
+		printf '\033[2K\r%s%s%s\n' "$BOLD" "$validation_no" "$RESET"
+		printf '\033[2K\r%sUse ↑/↓ and press Enter: %s' "$YELLOW" "$RESET"
+	}
+
+	printf '\n%s%s%s%s\n' "$BOLD" "$YELLOW" "$validation_prompt" "$RESET"
+	draw_validation_menu
+
+	while :; do
+		IFS= read -rsn1 key
+
+		if [ "$key" = $'\e' ]; then
+			IFS= read -rsn2 key_suffix
+			key="$key$key_suffix"
+		fi
+
+		case "$key" in
+		$'\e[A')
+			validation_selected=0
+			;;
+		$'\e[B')
+			validation_selected=1
+			;;
+		'' | $'\n')
+			printf '\n'
+			return "$validation_selected"
+			;;
+		esac
+
+		printf '\033[2A'
+		draw_validation_menu
+	done
+}
+
+# Show one result icon for every Swift file passed to SwiftLint.
+show_lint_results() {
+	local lint_output_path="$1"
+	local lint_file
+	local warning_count
+	local error_count
+	local file_name
+
+	shift
+
+	for lint_file in "$@"; do
+		# SwiftLint diagnostics use: path:line:column: severity: message.
+		warning_count="$(awk -v root="$REPOSITORY_PATH/" -v file="$lint_file" '
+      (index($0, root file ":") == 1 || index($0, file ":") == 1) && /: warning:/ { count++ }
+      END { print count + 0 }
+    ' "$lint_output_path")"
+		error_count="$(awk -v root="$REPOSITORY_PATH/" -v file="$lint_file" '
+      (index($0, root file ":") == 1 || index($0, file ":") == 1) && /: error:/ { count++ }
+      END { print count + 0 }
+    ' "$lint_output_path")"
+		file_name="$(basename "$lint_file")"
+
+		if [ "$error_count" -gt 0 ]; then
+			printf '%s❌ %s%s\n' "$RED" "$file_name" "$RESET"
+		elif [ "$warning_count" -gt 0 ]; then
+			printf '%s⚠️ %s%s\n' "$YELLOW" "$file_name" "$RESET"
+		else
+			printf '%s✅ %s%s\n' "$GREEN" "$file_name" "$RESET"
+		fi
+	done
+}
+
+# Run SwiftLint quietly and display only per-file results.
+run_lint() {
+	local lint_output_path
+	local lint_status
+	local lint_violation_count
+
+	lint_output_path="$(mktemp "${TMPDIR:-/tmp}/swiftlint-review.XXXXXX")" || {
+		printf '%sUnable to create temporary SwiftLint output.%s\n' "$RED" "$RESET" >&2
+		return 1
+	}
+	register_temp_file "$lint_output_path"
+
+	swiftlint lint "$@" >"$lint_output_path" 2>&1
+	lint_status=$?
+	lint_violation_count="$(awk '/:[0-9]+:[0-9]+: (warning|error):/ { count++ } END { print count + 0 }' "$lint_output_path")"
+
+	show_lint_results "$lint_output_path" "${lint_display_paths[@]}"
+	rm -f "$lint_output_path"
+
+	if [ "$lint_violation_count" -gt 0 ]; then
+		return 1
+	fi
+
+	return "$lint_status"
+}
+
+# Run ShellCheck against this review script without changing any files.
+run_shellcheck() {
+	local shellcheck_output_path
+	local shellcheck_status
+
+	if ! command -v shellcheck >/dev/null 2>&1; then
+		shellcheck_result='missing'
+		printf '%sShellCheck is not installed. Install it with: brew install shellcheck%s\n' "$YELLOW" "$RESET" >&2
+		return 0
+	fi
+
+	shellcheck_output_path="$(mktemp "${TMPDIR:-/tmp}/shellcheck-review.XXXXXX")" || {
+		shellcheck_result='failed'
+		printf '%sUnable to create temporary ShellCheck output.%s\n' "$RED" "$RESET" >&2
+		return 1
+	}
+	register_temp_file "$shellcheck_output_path"
+
+	shellcheck --shell=bash --severity=warning "$REVIEW_SCRIPT_PATH" >"$shellcheck_output_path" 2>&1
+	shellcheck_status=$?
+
+	if [ "$shellcheck_status" -eq 0 ]; then
+		shellcheck_result='passed'
+		printf '%s✅ ShellCheck passed.%s\n' "$GREEN" "$RESET"
+	elif [ "$shellcheck_status" -eq 1 ]; then
+		shellcheck_result='warnings found'
+		printf '%s⚠️ ShellCheck found warnings.%s\n' "$YELLOW" "$RESET"
+		cat "$shellcheck_output_path"
+	else
+		shellcheck_result='failed'
+		printf '%s❌ ShellCheck failed to analyse the script.%s\n' "$RED" "$RESET" >&2
+		cat "$shellcheck_output_path" >&2
+	fi
+
+	rm -f "$shellcheck_output_path"
+	return 0
+}
+
+# Ask whether SwiftFormat should modify the selected Swift files.
+ask_swift_format() {
+	local format_selected=0
+	local format_yes
+	local format_no
+	local key
+	local key_suffix
+
+	draw_format_menu() {
+		if [ "$format_selected" -eq 0 ]; then
+			format_yes="${GREEN}❯ Yes${RESET}"
+			format_no="  No"
+		else
+			format_yes="  Yes"
+			format_no="${GREEN}❯ No${RESET}"
+		fi
+
+		printf '\033[2K\r%s%s%s\n' "$BOLD" "$format_yes" "$RESET"
+		printf '\033[2K\r%s%s%s\n' "$BOLD" "$format_no" "$RESET"
+		printf '\033[2K\r%sUse ↑/↓ and press Enter: %s' "$YELLOW" "$RESET"
+	}
+
+	printf '\n%s%sApply SwiftFormat changes to the selected files?%s\n' "$BOLD" "$YELLOW" "$RESET"
+	printf '%sThis will modify files in place.%s\n' "$RED" "$RESET"
+	# Default to No because SwiftFormat changes the worktree.
+	format_selected=1
+	draw_format_menu
+
+	while :; do
+		IFS= read -rsn1 key
+
+		if [ "$key" = $'\e' ]; then
+			IFS= read -rsn2 key_suffix
+			key="$key$key_suffix"
+		fi
+
+		case "$key" in
+		$'\e[A')
+			format_selected=0
+			;;
+		$'\e[B')
+			format_selected=1
+			;;
+		'' | $'\n')
+			printf '\n'
+			return "$format_selected"
+			;;
+		esac
+
+		printf '\033[2A'
+		draw_format_menu
+	done
+}
+
+# Ask whether to append free-form instructions to the AI review prompt.
+ask_custom_instructions() {
+	custom_review_instructions=""
+
+	if ask_validation 'Add custom instructions for the AI review?' 1; then
+		printf '\n%s%sPaste your instructions, then press Ctrl-D to finish:%s\n' "$BOLD" "$YELLOW" "$RESET"
+		custom_review_instructions="$(cat)"
+	fi
+}
+
+# Find schemes stored inside the configured Xcode project.
+load_xcode_schemes() {
+	local scheme_path
+	local scheme_name
+	local scheme_exists
+	local existing_scheme
+
+	xcode_schemes=()
+
+	while IFS= read -r scheme_path; do
+		scheme_name="${scheme_path##*/}"
+		scheme_name="${scheme_name%.xcscheme}"
+		scheme_exists=0
+
+		for existing_scheme in "${xcode_schemes[@]}"; do
+			if [ "$existing_scheme" = "$scheme_name" ]; then
+				scheme_exists=1
+				break
+			fi
+		done
+
+		if [ "$scheme_exists" -eq 0 ]; then
+			xcode_schemes+=("$scheme_name")
+		fi
+	done < <(find "$XCODE_PROJECT_PATH" -type f -path '*/xcschemes/*.xcscheme' -print 2>/dev/null | sort)
+}
+
+# Let the user choose which Xcode scheme should be built and tested.
+select_xcode_scheme() {
+	local scheme_count
+	local scheme_selected=0
+	local scheme_index
+	local scheme_option
+	local key
+	local key_suffix
+
+	if [ ! -e "$XCODE_PROJECT_PATH" ]; then
+		printf '%sXcode project not found: %s%s\n' "$RED" "$XCODE_PROJECT_PATH" "$RESET" >&2
+		return 1
+	fi
+
+	load_xcode_schemes
+	scheme_count="${#xcode_schemes[@]}"
+
+	if [ "$scheme_count" -eq 0 ]; then
+		printf '%sNo Xcode schemes were found in %s.%s\n' "$RED" "$XCODE_PROJECT_PATH" "$RESET" >&2
+		return 1
+	fi
+
+	draw_scheme_menu() {
+		for scheme_index in "${!xcode_schemes[@]}"; do
+			if [ "$scheme_index" -eq "$scheme_selected" ]; then
+				scheme_option="${GREEN}❯ ${xcode_schemes[$scheme_index]}${RESET}"
+			else
+				scheme_option="  ${xcode_schemes[$scheme_index]}"
+			fi
+
+			printf '\033[2K\r%s%s%s\n' "$BOLD" "$scheme_option" "$RESET"
+		done
+		printf '\033[2K\r%sUse ↑/↓ and press Enter: %s' "$YELLOW" "$RESET"
+	}
+
+	printf '\n%s%sSelect Xcode scheme:%s\n' "$BOLD" "$YELLOW" "$RESET"
+	draw_scheme_menu
+
+	while :; do
+		IFS= read -rsn1 key
+
+		if [ "$key" = $'\e' ]; then
+			IFS= read -rsn2 key_suffix
+			key="$key$key_suffix"
+		fi
+
+		case "$key" in
+		$'\e[A')
+			if [ "$scheme_selected" -gt 0 ]; then
+				scheme_selected=$((scheme_selected - 1))
+			fi
+			;;
+		$'\e[B')
+			if [ "$scheme_selected" -lt $((scheme_count - 1)) ]; then
+				scheme_selected=$((scheme_selected + 1))
+			fi
+			;;
+		'' | $'\n')
+			printf '\n'
+			XCODE_SCHEME="${xcode_schemes[$scheme_selected]}"
+			printf '%sSelected scheme: %s%s\n' "$GREEN" "$XCODE_SCHEME" "$RESET"
+			return 0
+			;;
+		esac
+
+		printf '\033[%sA' "$scheme_count"
+		draw_scheme_menu
+	done
+}
+
+# Format the selected Swift files in place after the user confirms.
+run_swift_format() {
+	local format_args=()
+	local format_path
+	local format_status=0
+
+	if ! command -v swift-format >/dev/null 2>&1; then
+		printf '%sSwiftFormat is missing. Install it with: brew install swift-format%s\n' "$YELLOW" "$RESET" >&2
+		return 1
+	fi
+
+	if [ "${#lint_display_paths[@]}" -eq 0 ]; then
+		printf '%sNo Swift files to format.%s\n' "$YELLOW" "$RESET"
+		return 0
+	fi
+
+	if [ -f "$SWIFT_FORMAT_CONFIG_PATH" ]; then
+		format_args+=(--configuration "$SWIFT_FORMAT_CONFIG_PATH")
+	elif [ -f "$GENERAL_SWIFT_FORMAT_CONFIG_PATH" ]; then
+		format_args+=(--configuration "$GENERAL_SWIFT_FORMAT_CONFIG_PATH")
+	fi
+
+	for format_path in "${lint_display_paths[@]}"; do
+		if ! swift-format -i "$format_path" "${format_args[@]}" >/dev/null 2>&1; then
+			format_status=1
+		fi
+	done
+
+	if [ "$format_status" -eq 0 ]; then
+		printf '%sSwiftFormat applied successfully to %s files.%s\n' "$GREEN" "${#lint_display_paths[@]}" "$RESET"
+		if ask_validation 'Recheck SwiftLint now?'; then
+			run_swiftlint || true
+		fi
+	else
+		printf '%sSwiftFormat failed for one or more files.%s\n' "$RED" "$RESET"
+	fi
+
+	return "$format_status"
+}
+
+# Run an optional Xcode build using the configured project and scheme.
+run_xcode_build() {
+	local xcode_output_path
+	local xcode_process_id
+	local xcode_status
+
+	if ! command -v xcodebuild >/dev/null 2>&1; then
+		printf '%sXcode build is unavailable because xcodebuild is missing.%s\n' "$YELLOW" "$RESET" >&2
+		return 1
+	fi
+
+	if [ ! -e "$XCODE_PROJECT_PATH" ]; then
+		printf '%sXcode project not found: %s%s\n' "$RED" "$XCODE_PROJECT_PATH" "$RESET" >&2
+		return 1
+	fi
+
+	xcode_output_path="$(mktemp "${TMPDIR:-/tmp}/xcode-build-review.XXXXXX")" || {
+		printf '%sUnable to create temporary Xcode build output.%s\n' "$RED" "$RESET" >&2
+		return 1
+	}
+	register_temp_file "$xcode_output_path"
+
+	xcodebuild \
+		-project "$XCODE_PROJECT_PATH" \
+		-scheme "$XCODE_SCHEME" \
+		-configuration "$XCODE_CONFIGURATION" \
+		build \
+		-quiet >"$xcode_output_path" 2>&1 &
+	xcode_process_id=$!
+
+	if wait_for_process "$xcode_process_id" "$REVIEW_TIMEOUT_SECONDS"; then
+		printf '%sXcode build passed.%s\n' "$GREEN" "$RESET"
+		xcode_status=0
+	else
+		printf '%sXcode build failed for scheme %s.%s\n' "$RED" "$XCODE_SCHEME" "$RESET"
+		tail -n 8 "$xcode_output_path"
+		xcode_status=1
+	fi
+
+	rm -f "$xcode_output_path"
+	return "$xcode_status"
+}
+
+# Run optional tests only after the configured Xcode build succeeds.
+run_xcode_tests() {
+	local xcode_output_path
+	local xcode_process_id
+	local xcode_tests_status
+
+	xcode_output_path="$(mktemp "${TMPDIR:-/tmp}/xcode-test-review.XXXXXX")" || {
+		printf '%sUnable to create temporary Xcode test output.%s\n' "$RED" "$RESET" >&2
+		return 1
+	}
+	register_temp_file "$xcode_output_path"
+
+	xcodebuild \
+		-project "$XCODE_PROJECT_PATH" \
+		-scheme "$XCODE_SCHEME" \
+		-configuration "$XCODE_CONFIGURATION" \
+		test \
+		-quiet >"$xcode_output_path" 2>&1 &
+	xcode_process_id=$!
+
+	if wait_for_process "$xcode_process_id" "$REVIEW_TIMEOUT_SECONDS"; then
+		printf '%sXcode tests passed.%s\n' "$GREEN" "$RESET"
+		xcode_tests_status=0
+	else
+		printf '%sXcode tests failed for scheme %s.%s\n' "$RED" "$XCODE_SCHEME" "$RESET"
+		tail -n 8 "$xcode_output_path"
+		xcode_tests_status=1
+	fi
+
+	rm -f "$xcode_output_path"
+	return "$xcode_tests_status"
+}
+
+# Prepare the Swift paths used by SwiftLint and SwiftFormat.
+prepare_swift_paths() {
+	local swift_file
+	local review_path
+
+	if ! cd "$REPOSITORY_PATH"; then
+		printf '%sUnable to access the repository.%s\n' "$RED" "$RESET" >&2
+		return 1
+	fi
+
+	if [ "$scope_selected" -eq 0 ]; then
+		lint_display_paths=()
+		while IFS= read -r swift_file; do
+			lint_display_paths+=("${swift_file#$REPOSITORY_PATH/}")
+		done < <(list_swift_files "$REPOSITORY_PATH")
+	elif [ "${#review_paths[@]}" -eq 0 ]; then
+		return 0
+	else
+		lint_paths=()
+		lint_display_paths=()
+
+		# Git can report non-Swift files, so exclude them from changed-file linting.
+		for review_path in "${review_paths[@]}"; do
+			if [ -d "$review_path" ]; then
+				lint_paths+=("$review_path")
+				while IFS= read -r swift_file; do
+					lint_display_paths+=("$swift_file")
+				done < <(list_swift_files "$review_path")
+			elif [[ "$review_path" == *.swift ]]; then
+				lint_paths+=("$review_path")
+				lint_display_paths+=("$review_path")
+			fi
+		done
+
+		if [ "${#lint_paths[@]}" -eq 0 ]; then
+			return 0
+		fi
+	fi
+}
+
+# Run SwiftLint against all files or only the selected changed Swift paths.
+run_swiftlint() {
+	local swiftlint_args=()
+
+	if ! command -v swiftlint >/dev/null 2>&1; then
+		printf '%sSwiftLint is missing. Install it with: brew install swiftlint%s\n' "$YELLOW" "$RESET" >&2
+		return 1
+	fi
+
+	# Use project settings only when both the SwiftLint config and Xcode project exist.
+	# Otherwise SwiftLint falls back to SwiftLint defaults.
+	if [ -f "$SWIFTLINT_CONFIG_PATH" ] && [ -e "$XCODE_PROJECT_PATH" ]; then
+		swiftlint_args+=(--config "$SWIFTLINT_CONFIG_PATH")
+	fi
+
+	if [ "$scope_selected" -eq 0 ]; then
+		run_lint "${swiftlint_args[@]}"
+	elif [ "${#lint_paths[@]}" -eq 0 ]; then
+		printf '%sNo changed Swift files to validate.%s\n' "$YELLOW" "$RESET"
+		return 0
+	else
+		run_lint "${swiftlint_args[@]}" "${lint_paths[@]}"
+	fi
+}
+
+# List tracked and untracked project files for the AI review scope selector.
+list_repository_files() {
+	if command -v git >/dev/null 2>&1 && [ -e "$GIT_PATH" ]; then
+		git -C "$REPOSITORY_PATH" ls-files --cached --others --exclude-standard
+	else
+		find "$REPOSITORY_PATH" \
+			-type f \
+			! -path "$REPOSITORY_PATH/.git/*" \
+			! -path "$REPOSITORY_PATH/.build/*" \
+			-print | sed "s#^$REPOSITORY_PATH/##"
+	fi
+}
+
+# Select which kinds of files are sent to Codex and Claude.
+select_ai_review_scope() {
+	# Match Standard review's default: review Swift files only.
+	local ai_scope_selected=1
+	local ai_scope_count=3
+	local ai_scope_index
+	local ai_scope_option
+	local key
+	local key_suffix
+	local candidate_path
+	local review_path
+	local source_path
+	local source_exists
+
+	ai_review_paths=()
+	ai_scope_options=(
+		'All selected files'
+		'Swift files only'
+		'Apple source files'
+	)
+
+	if [ "$scope_selected" -eq 0 ]; then
+		while IFS= read -r candidate_path; do
+			ai_review_paths+=("$candidate_path")
+		done < <(list_repository_files)
+	else
+		for review_path in "${review_paths[@]}"; do
+			if [ -d "$review_path" ]; then
+				while IFS= read -r source_path; do
+					ai_review_paths+=("$source_path")
+				done < <(find "$review_path" -type f -print)
+			else
+				ai_review_paths+=("$review_path")
+			fi
+		done
+	fi
+
+	draw_ai_scope_menu() {
+		for ai_scope_index in "${!ai_scope_options[@]}"; do
+			if [ "$ai_scope_index" -eq "$ai_scope_selected" ]; then
+				ai_scope_option="${GREEN}❯ ${ai_scope_options[$ai_scope_index]}${RESET}"
+			else
+				ai_scope_option="  ${ai_scope_options[$ai_scope_index]}"
+			fi
+
+			printf '\033[2K\r%s%s%s\n' "$BOLD" "$ai_scope_option" "$RESET"
+		done
+		printf '\033[2K\r%sUse ↑/↓ and press Enter: %s' "$YELLOW" "$RESET"
+	}
+
+	printf '\n%s%sWhat should be sent to Codex and Claude?%s\n' "$BOLD" "$YELLOW" "$RESET"
+	draw_ai_scope_menu
+
+	while :; do
+		IFS= read -rsn1 key
+
+		if [ "$key" = $'\e' ]; then
+			IFS= read -rsn2 key_suffix
+			key="$key$key_suffix"
+		fi
+
+		case "$key" in
+		$'\e[A')
+			if [ "$ai_scope_selected" -gt 0 ]; then
+				ai_scope_selected=$((ai_scope_selected - 1))
+			fi
+			;;
+		$'\e[B')
+			if [ "$ai_scope_selected" -lt $((ai_scope_count - 1)) ]; then
+				ai_scope_selected=$((ai_scope_selected + 1))
+			fi
+			;;
+		'' | $'\n')
+			printf '\n'
+			break
+			;;
+		esac
+
+		printf '\033[%sA' "$ai_scope_count"
+		draw_ai_scope_menu
+	done
+
+	if [ "$ai_scope_selected" -gt 0 ]; then
+		filtered_paths=()
+		for source_path in "${ai_review_paths[@]}"; do
+			source_exists=0
+
+			case "$source_path" in
+			*.swift)
+				source_exists=1
+				;;
+			*.m | *.mm | *.h | *.hh | *.hpp | *.xib | *.storyboard | *.plist | *.entitlements | *.xcconfig | *.pbxproj)
+				source_exists=1
+				;;
+			esac
+
+			if [ "$ai_scope_selected" -eq 1 ]; then
+				case "$source_path" in
+				*.swift)
+					source_exists=1
+					;;
+				*)
+					source_exists=0
+					;;
+				esac
+			fi
+
+			if [ "$source_exists" -eq 1 ]; then
+				filtered_paths+=("$source_path")
+			fi
+		done
+		ai_review_paths=("${filtered_paths[@]}")
+	fi
+
+	printf '%sSelected %s files for AI review.%s\n' "$GREEN" "${#ai_review_paths[@]}" "$RESET"
+}
+
+# Keep only the shared severity-icon lines from either reviewer.
+print_review_output() {
+	local review_output_path="$1"
+	local review_lines
+
+	review_lines="$(grep -E '^(🔴|🟠|🟡|🟢)' "$review_output_path")"
+
+	if [ -n "$review_lines" ]; then
+		printf '%s\n' "$review_lines"
+	else
+		cat "$review_output_path"
+	fi
+}
+
+print_reviewer_failure_details() {
+	local reviewer_name="$1"
+	local output_path="$2"
+
+	if [ -s "$output_path" ]; then
+		printf '%s%s response:%s\n' "$YELLOW" "$reviewer_name" "$RESET" >&2
+		sed -n '1,20p' "$output_path" >&2
+		if [ "$(wc -l <"$output_path")" -gt 20 ]; then
+			printf '%s(Only the first 20 lines are shown.)%s\n' "$YELLOW" "$RESET" >&2
+		fi
+	fi
+}
+
+# Return success when a reviewer produced at least one severity-marked finding.
+review_output_has_findings() {
+	grep -qE '^(🔴|🟠|🟡)' "$1"
+}
+
+# Accept only severity-marked findings or the exact clean-review response.
+review_output_is_valid() {
+	awk '
+		NF {
+			if ($0 ~ /^(🔴|🟠|🟡) \[(HIGH|MEDIUM|LOW)\] .+ - .+/) {
+				valid_finding = 1
+			} else if ($0 == "🟢 No issues found.") {
+				valid_clean = 1
+			} else {
+				invalid = 1
+			}
+		}
+		END { exit !(invalid == 0 && (valid_finding || valid_clean)) }
+	' "$1"
+}
+
+# Final synthesis findings must include severity and reviewer-overlap tags.
+synthesis_output_is_valid() {
+	awk '
+		NF {
+			if ($0 ~ /^(🔴|🟠|🟡) \[(HIGH|MEDIUM|LOW)\] \[(BOTH|CODEX|CLAUDE)\] /) {
+				valid_finding = 1
+			} else if ($0 == "🟢 No issues found.") {
+				valid_clean = 1
+			} else {
+				invalid = 1
+			}
+		}
+		END { exit !(invalid == 0 && (valid_finding || valid_clean)) }
+	' "$1"
+}
+
+# Select the reviewer used for the final synthesis.
+select_final_reviewer() {
+	local reviewer_selected=0
+	local reviewer_index
+	local reviewer_option
+	local key
+	local key_suffix
+	local reviewer_options=('Codex' 'Claude')
+
+	if [ "${FINAL_REVIEWER:-$STANDARD_AI_REVIEWER}" = 'claude' ]; then
+		reviewer_selected=1
+	fi
+
+	draw_reviewer_menu() {
+		for reviewer_index in "${!reviewer_options[@]}"; do
+			if [ "$reviewer_index" -eq "$reviewer_selected" ]; then
+				reviewer_option="${GREEN}❯ ${reviewer_options[$reviewer_index]}${RESET}"
+			else
+				reviewer_option="  ${reviewer_options[$reviewer_index]}"
+			fi
+			printf '\033[2K\r%s%s%s\n' "$BOLD" "$reviewer_option" "$RESET"
+		done
+		printf '\033[2K\r%sUse ↑/↓ and press Enter: %s' "$YELLOW" "$RESET"
+	}
+
+	printf '\n%s%sSelect the final AI reviewer:%s\n' "$BOLD" "$YELLOW" "$RESET"
+	draw_reviewer_menu
+
+	while :; do
+		IFS= read -rsn1 key
+		if [ "$key" = $'\e' ]; then
+			IFS= read -rsn2 key_suffix
+			key="$key$key_suffix"
+		fi
+
+		case "$key" in
+		$'\e[A')
+			if [ "$reviewer_selected" -gt 0 ]; then reviewer_selected=$((reviewer_selected - 1)); fi
+			;;
+		$'\e[B')
+			if [ "$reviewer_selected" -lt 1 ]; then reviewer_selected=$((reviewer_selected + 1)); fi
+			;;
+		'' | $'\n')
+			printf '\n'
+			if [ "$reviewer_selected" -eq 0 ]; then FINAL_REVIEWER='codex'; else FINAL_REVIEWER='claude'; fi
+			printf '%sSelected final reviewer: %s%s\n' "$GREEN" "${reviewer_options[$reviewer_selected]}" "$RESET"
+			return 0
+			;;
+		esac
+
+		printf '\033[2A'
+		draw_reviewer_menu
+	done
+}
+
+# Run the dual-review pipeline: independent reviews, cross-review, then final synthesis.
+run_dual_review_pipeline() {
+	local review_prompt_path
+	local codex_output_path
+	local claude_output_path
+	local codex_cross_prompt_path
+	local claude_cross_prompt_path
+	local codex_cross_output_path
+	local claude_cross_output_path
+	local codex_final_output_path
+	local claude_final_output_path
+	local synthesis_prompt_path
+	local synthesis_output_path
+	local review_file_count
+	local review_file_label
+	local codex_process_id
+	local claude_process_id
+	local codex_cross_process_id
+	local claude_cross_process_id
+	local synthesis_process_id
+	local codex_status=1
+	local claude_status=1
+	local review_status=1
+	local synthesis_status=1
+	local findings_status=0
+	local shared_count
+	local codex_only_count
+	local claude_only_count
+	local report_timestamp
+	local review_report_path
+	local codex_report_path
+	local claude_report_path
+	local comparison_report_path
+	local review_path
+	local ai_review_path
+
+	if ! command -v codex >/dev/null 2>&1 || ! command -v claude >/dev/null 2>&1; then
+		printf '%sBoth Codex and Claude are required for the review workflow.%s\n' "$RED" "$RESET" >&2
+		return 1
+	fi
+
+	if [ "$scope_selected" -eq 1 ] && [ -z "$changed_files" ]; then
+		printf '%sNo Git changes to review.%s\n' "$YELLOW" "$RESET"
+		return 0
+	fi
+
+	if [ "${#ai_review_paths[@]}" -eq 0 ]; then
+		printf '%sNo files selected for AI review.%s\n' "$YELLOW" "$RESET"
+		return 0
+	fi
+
+	review_prompt_path="$(mktemp "${TMPDIR:-/tmp}/codex-review-prompt.XXXXXX")" || {
+		printf '%sUnable to create the Codex review prompt.%s\n' "$RED" "$RESET" >&2
+		return 1
+	}
+	register_temp_file "$review_prompt_path"
+	codex_output_path="$(mktemp "${TMPDIR:-/tmp}/codex-review-output.XXXXXX")" || {
+		rm -f "$review_prompt_path"
+		printf '%sUnable to create the Codex review output.%s\n' "$RED" "$RESET" >&2
+		return 1
+	}
+	register_temp_file "$codex_output_path"
+	claude_output_path="$(mktemp "${TMPDIR:-/tmp}/claude-review-output.XXXXXX")" || {
+		rm -f "$review_prompt_path" "$codex_output_path"
+		printf '%sUnable to create the Claude review output.%s\n' "$RED" "$RESET" >&2
+		return 1
+	}
+	register_temp_file "$claude_output_path"
+
+	{
+		printf '%s\n' \
+			'Perform a careful code review of this repository.' \
+			'You are reviewing code only. Do not modify files, run formatters, or make commits.' \
+			'Only inspect files included in the selected review scope.' \
+			'Look for bugs, regressions, unsafe behavior, broken edge cases, and missing tests.' \
+			'Prioritize actionable findings over style suggestions.' \
+			'For each finding, include severity, file path, line number when possible, and a concise explanation.' \
+			'Return findings only. Do not add an introduction, conclusion, praise, checklist, or review narrative.' \
+			'Return exactly one finding per line with no Markdown bullets or extra paragraphs.' \
+			'Do not report the documented official Codex or Claude installer commands in ensure_dual_reviewers as findings; they are intentional accepted workflow decisions.' \
+			'Use this format:' \
+			'🔴 [HIGH] path/to/file.swift:123 - finding' \
+			'🟠 [MEDIUM] path/to/file.swift:45 - finding' \
+			'🟡 [LOW] path/to/file.swift:8 - finding' \
+			'Use 🔴 for critical findings, 🔴 for HIGH, 🟠 for MEDIUM, and 🟡 for LOW.' \
+			'If there are no findings, return exactly: 🟢 No issues found.'
+
+		if [ -n "${custom_review_instructions:-}" ]; then
+			printf '\n%s\n' 'Additional instructions from the requester:'
+			printf '%s\n' "$custom_review_instructions"
+		fi
+
+		if [ "$scope_selected" -eq 1 ]; then
+			printf '\n%s\n' 'Review scope: selected Git-change files.'
+			printf '%s\n' 'Git status:'
+			git status --short
+			printf '\n%s\n' 'Git diff:'
+			git --no-pager diff --no-ext-diff HEAD -- "${ai_review_paths[@]}"
+		else
+			printf '\n%s\n' 'Review scope: selected repository files.'
+		fi
+
+		printf '\n%s\n' 'Only review these selected paths:'
+		for ai_review_path in "${ai_review_paths[@]}"; do
+			printf '%s\n' "$ai_review_path"
+		done
+	} >"$review_prompt_path"
+
+	review_file_count="${#ai_review_paths[@]}"
+	if [ "$scope_selected" -eq 1 ]; then
+		review_file_label='selected Git-change files'
+	else
+		review_file_label='selected repository files'
+	fi
+
+	printf '\n%sRunning Codex review for %s %s...%s\n' "$YELLOW" "$review_file_count" "$review_file_label" "$RESET"
+	codex exec \
+		--ephemeral \
+		--sandbox read-only \
+		--color never \
+		-C "$REPOSITORY_PATH" \
+		-o "$codex_output_path" \
+		- <"$review_prompt_path" >/dev/null 2>&1 &
+	codex_process_id=$!
+
+	if command -v claude >/dev/null 2>&1; then
+		printf '\n%sRunning Claude review for %s %s...%s\n' "$YELLOW" "$review_file_count" "$review_file_label" "$RESET"
+		(cd "$REPOSITORY_PATH" && exec claude -p \
+			--model haiku \
+			--output-format text \
+			--restricted \
+			--permission-prompts none \
+			<"$review_prompt_path" >"$claude_output_path" 2>/dev/null) &
+		claude_process_id=$!
+	else
+		printf '%sClaude Code CLI is missing; the review cannot continue.%s\n' "$RED" "$RESET" >&2
+		claude_status=1
+	fi
+
+	# Both independent reviewers are already running. Wait for each one now so
+	# their network and model work can happen at the same time.
+	if wait_for_process "$codex_process_id" "$REVIEW_TIMEOUT_SECONDS" && review_output_is_valid "$codex_output_path"; then
+		printf '\n%sCodex review%s\n' "$BOLD" "$RESET"
+		print_review_output "$codex_output_path"
+		printf '\n'
+		codex_status=0
+	else
+		printf '%sCodex review failed.%s\n' "$RED" "$RESET" >&2
+		print_reviewer_failure_details 'Codex' "$codex_output_path"
+		codex_status=1
+	fi
+
+	if [ -n "${claude_process_id:-}" ]; then
+		if wait_for_process "$claude_process_id" "$REVIEW_TIMEOUT_SECONDS" && review_output_is_valid "$claude_output_path"; then
+			printf '\n%sClaude review%s\n' "$BOLD" "$RESET"
+			print_review_output "$claude_output_path"
+			printf '\n'
+			claude_status=0
+		else
+			printf '%sClaude review failed.%s\n' "$RED" "$RESET" >&2
+			print_reviewer_failure_details 'Claude' "$claude_output_path"
+			claude_status=1
+		fi
+	fi
+
+	codex_final_output_path="$codex_output_path"
+	claude_final_output_path="$claude_output_path"
+
+	if [ "$codex_status" -eq 0 ] && [ "$claude_status" -eq 0 ] &&
+		! review_output_has_findings "$codex_output_path" &&
+		! review_output_has_findings "$claude_output_path"; then
+		printf '\n%sBoth reviewers found no issues; skipping cross-review and final synthesis.%s\n' "$GREEN" "$RESET"
+		synthesis_status=0
+
+		report_timestamp="$(date '+%Y-%m-%d_%H-%M-%S')"
+		review_report_path="$REVIEW_REPORT_DIRECTORY/$REVIEW_REPORT_PREFIX-$report_timestamp.txt"
+		codex_report_path="$REVIEW_REPORT_DIRECTORY/$REVIEW_REPORT_PREFIX-$report_timestamp-codex.txt"
+		claude_report_path="$REVIEW_REPORT_DIRECTORY/$REVIEW_REPORT_PREFIX-$report_timestamp-claude.txt"
+		comparison_report_path="$REVIEW_REPORT_DIRECTORY/$REVIEW_REPORT_PREFIX-$report_timestamp-comparison.txt"
+
+		if [ -d "$REVIEW_REPORT_DIRECTORY" ]; then
+			{
+				printf '%s\n' '🤖 Codex review output'
+				printf '\n%s\n' '📄 Files sent to the reviewers'
+				printf '%s\n' "${ai_review_paths[@]}"
+				printf '\n%s\n' '🔎 Findings'
+				cat "$codex_output_path"
+			} >"$codex_report_path"
+
+			{
+				printf '%s\n' '🤖 Claude review output'
+				printf '\n%s\n' '📄 Files sent to the reviewers'
+				printf '%s\n' "${ai_review_paths[@]}"
+				printf '\n%s\n' '🔎 Findings'
+				cat "$claude_output_path"
+			} >"$claude_report_path"
+
+			{
+				printf '%s\n' '🔎 Review comparison'
+				printf '\n%s\n' '📄 Files sent to the reviewers'
+				printf '%s\n' "${ai_review_paths[@]}"
+				printf '\n%s\n' '🔎 Findings'
+				printf '%s\n' '🟢 No issues found by either reviewer.'
+				printf '%s\n' 'Cross-review and final synthesis were skipped because both independent reviews were clean.'
+			} >"$comparison_report_path"
+
+			{
+				printf '%s\n' '🧪 Code review report'
+				printf '%s\n' '📊 Result: clean review'
+				printf '%s\n' '🤖 Codex: no issues found'
+				printf '%s\n' '🤖 Claude: no issues found'
+				printf '%s\n' '🔎 Cross-review: skipped because both reviews were clean'
+				printf '%s\n' "📄 Codex report: $codex_report_path"
+				printf '%s\n' "📄 Claude report: $claude_report_path"
+				printf '%s\n' "📄 Comparison report: $comparison_report_path"
+			} >"$review_report_path"
+
+			printf '%sSaved clean review reports: %s%s\n' "$GREEN" "$REVIEW_REPORT_DIRECTORY" "$RESET"
+		fi
+	fi
+
+	if [ "$codex_status" -eq 0 ] && [ "$claude_status" -eq 0 ] &&
+		(review_output_has_findings "$codex_output_path" || review_output_has_findings "$claude_output_path"); then
+		codex_cross_prompt_path="$(mktemp "${TMPDIR:-/tmp}/codex-cross-review-prompt.XXXXXX")"
+		claude_cross_prompt_path="$(mktemp "${TMPDIR:-/tmp}/claude-cross-review-prompt.XXXXXX")"
+		codex_cross_output_path="$(mktemp "${TMPDIR:-/tmp}/codex-cross-review-output.XXXXXX")"
+		claude_cross_output_path="$(mktemp "${TMPDIR:-/tmp}/claude-cross-review-output.XXXXXX")"
+
+		if [ -n "$codex_cross_prompt_path" ] && [ -n "$claude_cross_prompt_path" ] && [ -n "$codex_cross_output_path" ] && [ -n "$claude_cross_output_path" ]; then
+			register_temp_file "$codex_cross_prompt_path"
+			register_temp_file "$claude_cross_prompt_path"
+			register_temp_file "$codex_cross_output_path"
+			register_temp_file "$claude_cross_output_path"
+
+			{
+				cat "$review_prompt_path"
+				printf '\n%s\n' \
+					'Claude has completed an independent review below.' \
+					'Now verify Claude findings against the code, confirm or reject them, and add any missing findings.' \
+					'Return findings only in the required severity-icon format.' \
+					'Claude independent findings:'
+				print_review_output "$claude_output_path"
+			} >"$codex_cross_prompt_path"
+
+			{
+				cat "$review_prompt_path"
+				printf '\n%s\n' \
+					'Codex has completed an independent review below.' \
+					'Now verify Codex findings against the code, confirm or reject them, and add any missing findings.' \
+					'Return findings only in the required severity-icon format.' \
+					'Codex independent findings:'
+				print_review_output "$codex_output_path"
+			} >"$claude_cross_prompt_path"
+
+			printf '\n%sCross-reviewing Codex and Claude findings...%s\n' "$YELLOW" "$RESET"
+
+			codex exec \
+				--ephemeral \
+				--sandbox read-only \
+				--color never \
+				-C "$REPOSITORY_PATH" \
+				-o "$codex_cross_output_path" \
+				- <"$codex_cross_prompt_path" >/dev/null 2>&1 &
+			codex_cross_process_id=$!
+
+			(cd "$REPOSITORY_PATH" && exec claude -p \
+				--model haiku \
+				--output-format text \
+				--restricted \
+				--permission-prompts none \
+				<"$claude_cross_prompt_path" >"$claude_cross_output_path" 2>/dev/null) &
+			claude_cross_process_id=$!
+
+			if wait_for_process "$codex_cross_process_id" "$REVIEW_TIMEOUT_SECONDS" && review_output_is_valid "$codex_cross_output_path"; then
+				printf '\n%sCodex response to Claude%s\n' "$BOLD" "$RESET"
+				print_review_output "$codex_cross_output_path"
+				printf '\n'
+				codex_final_output_path="$codex_cross_output_path"
+			else
+				printf '%sCodex cross-review failed.%s\n' "$RED" "$RESET" >&2
+			fi
+
+			if wait_for_process "$claude_cross_process_id" "$REVIEW_TIMEOUT_SECONDS" && review_output_is_valid "$claude_cross_output_path"; then
+				printf '\n%sClaude response to Codex%s\n' "$BOLD" "$RESET"
+				print_review_output "$claude_cross_output_path"
+				printf '\n'
+				claude_final_output_path="$claude_cross_output_path"
+			else
+				printf '%sClaude cross-review failed.%s\n' "$RED" "$RESET" >&2
+			fi
+		fi
+
+		synthesis_prompt_path="$(mktemp "${TMPDIR:-/tmp}/review-synthesis-prompt.XXXXXX")"
+		synthesis_output_path="$(mktemp "${TMPDIR:-/tmp}/review-synthesis-output.XXXXXX")"
+
+		if [ -n "$synthesis_prompt_path" ] && [ -n "$synthesis_output_path" ]; then
+			register_temp_file "$synthesis_prompt_path"
+			register_temp_file "$synthesis_output_path"
+			{
+				printf '%s\n' \
+					'Compare the Codex and Claude code-review findings below.' \
+					'Group semantically equivalent findings together, even when wording differs.' \
+					'Do not invent new findings and do not resolve disagreements without evidence.' \
+					'Return one merged list of unique findings.' \
+					'Add [BOTH] after the severity when both reviewers identified the same issue.' \
+					'Add [CODEX] after the severity when only Codex identified it.' \
+					'Add [CLAUDE] after the severity when only Claude identified it.' \
+					'Use the original severity icons and severity labels:' \
+					'🔴 [HIGH] [BOTH] path/to/file.swift:123 - finding' \
+					'🟠 [MEDIUM] [CODEX] path/to/file.swift:45 - finding' \
+					'🟡 [LOW] [CLAUDE] path/to/file.swift:8 - finding' \
+					'Return only the merged findings list.' \
+					'If there are no findings, return exactly: 🟢 No issues found.' \
+					'' \
+					'Codex findings:'
+				print_review_output "$codex_final_output_path"
+				printf '\n%s\n' 'Claude findings:'
+				print_review_output "$claude_final_output_path"
+			} >"$synthesis_prompt_path"
+
+			printf '\n%sFinal reviewer (%s) is synthesizing Codex and Claude findings...%s\n' "$YELLOW" "$FINAL_REVIEWER" "$RESET"
+			if [ "$FINAL_REVIEWER" = 'claude' ]; then
+				(cd "$REPOSITORY_PATH" && exec claude -p \
+					--model haiku \
+					--output-format text \
+					--restricted \
+					--permission-prompts none \
+					<"$synthesis_prompt_path" >"$synthesis_output_path" 2>/dev/null) &
+			else
+				codex exec \
+					--ephemeral \
+					--sandbox read-only \
+					--color never \
+					-C "$REPOSITORY_PATH" \
+					-o "$synthesis_output_path" \
+					- <"$synthesis_prompt_path" >/dev/null 2>&1 &
+			fi
+			synthesis_process_id=$!
+			if wait_for_process "$synthesis_process_id" "$REVIEW_TIMEOUT_SECONDS" && synthesis_output_is_valid "$synthesis_output_path"; then
+				synthesis_status=0
+				printf '\n%sFinal %s review%s\n' "$BOLD" "$FINAL_REVIEWER" "$RESET"
+				cat "$synthesis_output_path"
+				printf '\n'
+
+				shared_count="$(grep -c '\[BOTH\]' "$synthesis_output_path" || true)"
+				codex_only_count="$(grep -c '\[CODEX\]' "$synthesis_output_path" || true)"
+				claude_only_count="$(grep -c '\[CLAUDE\]' "$synthesis_output_path" || true)"
+
+				printf '\n%sReview summary%s\n' "$BOLD" "$RESET"
+				printf '🔴 %s shared findings\n' "$shared_count"
+				printf '🟠 %s Codex-only findings\n' "$codex_only_count"
+				printf '🟡 %s Claude-only findings\n' "$claude_only_count"
+
+				if review_output_has_findings "$synthesis_output_path"; then
+					findings_status=1
+				fi
+
+				report_timestamp="$(date '+%Y-%m-%d_%H-%M-%S')"
+				review_report_path="$REVIEW_REPORT_DIRECTORY/$REVIEW_REPORT_PREFIX-$report_timestamp.txt"
+				if [ -d "$REVIEW_REPORT_DIRECTORY" ]; then
+					codex_report_path="$REVIEW_REPORT_DIRECTORY/$REVIEW_REPORT_PREFIX-$report_timestamp-codex.txt"
+					claude_report_path="$REVIEW_REPORT_DIRECTORY/$REVIEW_REPORT_PREFIX-$report_timestamp-claude.txt"
+					comparison_report_path="$REVIEW_REPORT_DIRECTORY/$REVIEW_REPORT_PREFIX-$report_timestamp-comparison.txt"
+
+					{
+						printf '%s\n' '🤖 Codex review output'
+						printf '\n%s\n' '📄 Files sent to the reviewers'
+						printf '%s\n' "${ai_review_paths[@]}"
+						printf '\n%s\n' '📝 Output context: Codex independent review, or Codex response to Claude after cross-review.'
+						printf '\n%s\n' '🔎 Findings'
+						cat "$codex_final_output_path"
+					} >"$codex_report_path"
+
+					{
+						printf '%s\n' '🤖 Claude review output'
+						printf '\n%s\n' '📄 Files sent to the reviewers'
+						printf '%s\n' "${ai_review_paths[@]}"
+						printf '\n%s\n' '📝 Output context: Claude independent review, or Claude response to Codex after cross-review.'
+						printf '\n%s\n' '🔎 Findings'
+						cat "$claude_final_output_path"
+					} >"$claude_report_path"
+
+					{
+						printf '%s\n' '🔎 Review comparison'
+						printf '\n%s\n' '📄 Files sent to the reviewers'
+						printf '%s\n' "${ai_review_paths[@]}"
+						printf '\n%s\n' '🔎 Findings'
+						cat "$synthesis_output_path"
+					} >"$comparison_report_path"
+
+					{
+						printf '%s\n' '🧪 Code review report'
+						printf '\n%s\n' '🛠️ Validation'
+						printf '🛡️ ShellCheck: %s\n' "${shellcheck_result:-skipped}"
+						printf '🏗️ Xcode build: %s\n' "${build_status:-skipped}"
+						printf '🧪 Xcode tests: %s\n' "${tests_status:-skipped}"
+						printf '\n%s\n' '📄 Files sent to the reviewers'
+						printf '%s\n' "${ai_review_paths[@]}"
+						printf '\n%s\n' '🔎 Review comparison'
+						cat "$synthesis_output_path"
+						printf '\n%s\n' '📊 Review summary'
+						printf '🔴 %s shared findings\n' "$shared_count"
+						printf '🟠 %s Codex-only findings\n' "$codex_only_count"
+						printf '🟡 %s Claude-only findings\n' "$claude_only_count"
+					} >"$review_report_path"
+					printf '\n%sSaved review report: %s%s\n' "$GREEN" "$review_report_path" "$RESET"
+					printf '%sSaved Codex report: %s%s\n' "$GREEN" "$codex_report_path" "$RESET"
+					printf '%sSaved Claude report: %s%s\n' "$GREEN" "$claude_report_path" "$RESET"
+					printf '%sSaved comparison report: %s%s\n' "$GREEN" "$comparison_report_path" "$RESET"
+				else
+					printf '%sReview report directory not found: %s%s\n' "$YELLOW" "$REVIEW_REPORT_DIRECTORY" "$RESET" >&2
+				fi
+			else
+				printf '%sReview comparison failed.%s\n' "$RED" "$RESET" >&2
+			fi
+
+			rm -f "$synthesis_prompt_path" "$synthesis_output_path"
+		fi
+	fi
+
+	# Intentional contract: both independent reviews and final synthesis are required.
+	if [ "$codex_status" -eq 0 ] && [ "$claude_status" -eq 0 ] && [ "$synthesis_status" -eq 0 ]; then
+		review_status=0
+	else
+		review_status=1
+	fi
+
+	if [ "${findings_status:-0}" -ne 0 ]; then
+		review_status=1
+	fi
+
+	rm -f "$review_prompt_path" "$codex_output_path" "$claude_output_path"
+	return "$review_status"
+}
+
+# Save a local-only report when the AI review is declined.
+save_local_review_report() {
+	local report_timestamp
+	local review_report_path
+
+	report_timestamp="$(date '+%Y-%m-%d_%H-%M-%S')"
+	review_report_path="$REVIEW_REPORT_DIRECTORY/$REVIEW_REPORT_PREFIX-$report_timestamp.txt"
+
+	if [ ! -d "$REVIEW_REPORT_DIRECTORY" ]; then
+		printf '%sReview report directory not found: %s%s\n' "$YELLOW" "$REVIEW_REPORT_DIRECTORY" "$RESET" >&2
+		return 1
+	fi
+
+	{
+		printf '%s\n' '🧪 Code review report'
+		printf '📂 Scope: %s\n' "$([ "$scope_selected" -eq 0 ] && printf 'all files' || printf 'Git changes')"
+		printf '🛡️ ShellCheck: %s\n' "${shellcheck_result:-skipped}"
+		printf '🔍 SwiftLint: %s\n' "$([ "${swiftlint_requested:-0}" -eq 1 ] && printf 'selected' || printf 'skipped')"
+		printf '✨ SwiftFormat: %s\n' "$([ "${format_requested:-0}" -eq 1 ] && printf 'applied' || printf 'skipped')"
+		printf '🏗️ Xcode build: %s\n' "${build_status:-skipped}"
+		printf '🧪 Xcode tests: %s\n' "${tests_status:-skipped}"
+		printf '🤖 AI review: skipped by user\n'
+
+		if [ "$scope_selected" -eq 1 ]; then
+			printf '\n📝 Changed paths:\n'
+			printf '%s\n' "${review_paths[@]}"
+		else
+			printf '\n📄 Swift files considered: %s\n' "${#lint_display_paths[@]}"
+		fi
+	} >"$review_report_path"
+
+	printf '\n%sSaved review report: %s%s\n' "$GREEN" "$review_report_path" "$RESET"
+}
+
+# Draw the standard/custom review mode selector.
+review_mode_selected=0
+
+draw_review_mode_menu() {
+	if [ "$review_mode_selected" -eq 0 ]; then
+		option_one="${GREEN}❯ Standard review (recommended)${RESET}"
+		option_two="  Customize review"
+	else
+		option_one="  Standard review (recommended)"
+		option_two="${GREEN}❯ Customize review${RESET}"
+	fi
+
+	printf '\033[2K\r%s%s%s\n' "$BOLD" "$option_one" "$RESET"
+	printf '\033[2K\r%s%s%s\n' "$BOLD" "$option_two" "$RESET"
+	printf '\033[2K\r%sUse ↑/↓ and press Enter: %s' "$YELLOW" "$RESET"
+}
+
+select_review_mode() {
+	local key
+	local key_suffix
+
+	printf '%s%s%s\n' "$BOLD" "$YELLOW" 'How would you like to run the review?'
+	draw_review_mode_menu
+
+	while :; do
+		IFS= read -rsn1 key
+
+		if [ "$key" = $'\e' ]; then
+			IFS= read -rsn2 key_suffix
+			key="$key$key_suffix"
+		fi
+
+		case "$key" in
+		$'\e[A') review_mode_selected=0 ;;
+		$'\e[B') review_mode_selected=1 ;;
+		'' | $'\n')
+			printf '\n'
+			return 0
+			;;
+		esac
+
+		printf '\033[2A'
+		draw_review_mode_menu
+	done
+}
+
+# Show the configured defaults before running Standard review.
+show_standard_review_defaults() {
+	local review_scope_label
+	local shellcheck_label
+	local swiftlint_label
+	local swiftformat_label
+	local build_label
+	local tests_label
+	local ai_review_label
+
+	if [ "$STANDARD_REVIEW_SCOPE" = 'all' ]; then
+		review_scope_label='all files'
+	else
+		review_scope_label='Git changes'
+	fi
+
+	if [ "$STANDARD_RUN_SHELLCHECK" -eq 1 ]; then
+		shellcheck_label='enabled'
+	else
+		shellcheck_label='skipped'
+	fi
+
+	if [ "$STANDARD_RUN_SWIFTLINT" -eq 1 ]; then
+		swiftlint_label='enabled'
+	else
+		swiftlint_label='skipped'
+	fi
+
+	if [ "$STANDARD_APPLY_SWIFTFORMAT" -eq 1 ]; then
+		swiftformat_label='enabled (applies changes)'
+	else
+		swiftformat_label='skipped'
+	fi
+
+	if [ "$STANDARD_RUN_XCODE_BUILD" -eq 1 ]; then
+		build_label='enabled'
+	else
+		build_label='skipped'
+	fi
+
+	if [ "$STANDARD_RUN_XCODE_TESTS" -eq 1 ]; then
+		tests_label='enabled'
+	else
+		tests_label='skipped'
+	fi
+
+	if [ "$STANDARD_RUN_AI_REVIEW" -eq 1 ]; then
+		ai_review_label="enabled (Codex + Claude; final: $STANDARD_AI_REVIEWER, $STANDARD_AI_SCOPE files)"
+	else
+		ai_review_label='skipped'
+	fi
+
+	printf '\n%s%sStandard review defaults:%s\n' "$BOLD" "$YELLOW" "$RESET"
+	printf '  Review scope: %s\n' "$review_scope_label"
+	printf '  ShellCheck: %s\n' "$shellcheck_label"
+	printf '  SwiftLint: %s\n' "$swiftlint_label"
+	printf '  SwiftFormat: %s\n' "$swiftformat_label"
+	printf '  Xcode build: %s\n' "$build_label"
+	printf '  Xcode tests: %s\n' "$tests_label"
+	printf '  AI review: %s\n' "$ai_review_label"
+}
+
+# Select the review mode before any detailed questions.
+select_review_mode
+
+if [ "$review_mode_selected" -eq 0 ]; then
+	printf '%sSelected: Standard review%s\n' "$GREEN" "$RESET"
+	show_standard_review_defaults
+
+	if [ "$STANDARD_REVIEW_SCOPE" = 'all' ]; then
+		scope_selected=0
+	else
+		scope_selected=1
+		if ! command -v git >/dev/null 2>&1 || ! show_changed_files; then
+			exit 1
+		fi
+	fi
+
+	prepare_swift_paths || true
+
+	if [ "$STANDARD_RUN_SHELLCHECK" -eq 1 ]; then
+		run_shellcheck
+	else
+		shellcheck_result='skipped'
+	fi
+
+	if [ "$STANDARD_RUN_SWIFTLINT" -eq 1 ]; then
+		swiftlint_requested=1
+		run_swiftlint || true
+	else
+		swiftlint_requested=0
+	fi
+
+	if [ "$STANDARD_APPLY_SWIFTFORMAT" -eq 1 ]; then
+		format_requested=1
+		run_swift_format
+	else
+		format_requested=0
+	fi
+
+	if [ "$STANDARD_RUN_XCODE_BUILD" -eq 1 ]; then
+		if select_xcode_scheme && run_xcode_build; then
+			build_status='passed'
+
+			if [ "$STANDARD_RUN_XCODE_TESTS" -eq 1 ]; then
+				if run_xcode_tests; then
+					tests_status='passed'
+				else
+					tests_status='failed'
+				fi
+			else
+				tests_status='skipped'
+			fi
+		else
+			build_status='failed'
+			tests_status='skipped (build failed)'
+		fi
+	else
+		build_status='skipped'
+		tests_status='skipped'
+	fi
+
+	if [ "$STANDARD_RUN_AI_REVIEW" -eq 1 ]; then
+		FINAL_REVIEWER="$STANDARD_AI_REVIEWER"
+		if ! ensure_dual_reviewers; then
+			exit 1
+		fi
+
+		ai_review_paths=()
+		if [ "$scope_selected" -eq 0 ]; then
+			while IFS= read -r ai_review_path; do
+				ai_review_paths+=("$ai_review_path")
+			done < <(list_repository_files)
+		else
+			ai_review_paths=("${review_paths[@]}")
+		fi
+
+		if [ "$STANDARD_AI_SCOPE" = 'swift' ]; then
+			filtered_paths=()
+			for ai_review_path in "${ai_review_paths[@]}"; do
+				case "$ai_review_path" in
+				*.swift) filtered_paths+=("$ai_review_path") ;;
+				esac
+			done
+			ai_review_paths=("${filtered_paths[@]}")
+		fi
+
+		if [ "${#ai_review_paths[@]}" -gt 0 ]; then
+			run_dual_review_pipeline
+		else
+			printf '%sNo files selected for AI review.%s\n' "$YELLOW" "$RESET"
+			save_local_review_report
+		fi
+	else
+		save_local_review_report
+	fi
+else
+	# Run ShellCheck first: it lints this script itself, independent of review scope.
+	if ask_validation 'Run ShellCheck validation?' 1; then
+		run_shellcheck
+	else
+		shellcheck_result='skipped'
+	fi
+
+	# Draw the all-files / changed-files scope selector for Customize review.
+	# Default to reviewing only Git changes.
+	selected=1
+
+	draw_menu() {
+		if [ "$selected" -eq 0 ]; then
+			option_one="${GREEN}❯ All files${RESET}"
+			option_two="  Only Git changes"
+		else
+			option_one="  All files"
+			option_two="${GREEN}❯ Only Git changes${RESET}"
+		fi
+
+		printf '\033[2K\r%s%s%s\n' "$BOLD" "$option_one" "$RESET"
+		printf '\033[2K\r%s%s%s\n' "$BOLD" "$option_two" "$RESET"
+		printf '\033[2K\r%sUse ↑/↓ and press Enter: %s' "$YELLOW" "$RESET"
+	}
+
+	printf '%s%s%s\n' "$BOLD" "$YELLOW" 'What should be reviewed?'
+	draw_menu
+
+	# Read arrow-key input until the user confirms a review scope.
+	while :; do
+		IFS= read -rsn1 key
+
+		if [ "$key" = $'\e' ]; then
+			IFS= read -rsn2 key_suffix
+			key="$key$key_suffix"
+		fi
+
+		case "$key" in
+		$'\e[A')
+			selected=0
+			;;
+		$'\e[B')
+			selected=1
+			;;
+		'' | $'\n')
+			printf '\n'
+			scope_selected="$selected"
+			if [ "$selected" -eq 0 ]; then
+				printf '%sSelected: all files%s\n' "$GREEN" "$RESET"
+			else
+				printf '%sSelected: only Git changes%s\n' "$GREEN" "$RESET"
+
+				if ! command -v git >/dev/null 2>&1; then
+					printf '%sGit is not installed or not available in PATH.%s\n' "$RED" "$RESET" >&2
+					exit 1
+				fi
+
+				if ! show_changed_files; then
+					exit 1
+				fi
+			fi
+			break
+			;;
+		esac
+
+		printf '\033[2A'
+		draw_menu
+	done
+
+	prepare_swift_paths || true
+
+	# Intentional: default to No so pressing Enter matches Standard review.
+	if ask_validation 'Run SwiftLint validation?' 1; then
+		swiftlint_requested=1
+		run_swiftlint || true
+	else
+		swiftlint_requested=0
+	fi
+
+	if ask_swift_format; then
+		format_requested=1
+		run_swift_format
+	else
+		format_requested=0
+	fi
+
+	if ask_validation 'Run Xcode build?' 1; then
+		if select_xcode_scheme && run_xcode_build; then
+			build_status='passed'
+
+			if ask_validation 'Run Xcode tests?' 1; then
+				if run_xcode_tests; then
+					tests_status='passed'
+				else
+					tests_status='failed'
+				fi
+			else
+				tests_status='skipped'
+			fi
+		else
+			build_status='failed'
+			tests_status='skipped (build failed)'
+		fi
+	else
+		build_status='skipped'
+		tests_status='skipped'
+	fi
+
+	if ask_validation 'Run AI code review?'; then
+		select_final_reviewer
+		if ! ensure_dual_reviewers; then
+			exit 1
+		fi
+
+		if select_ai_review_scope && [ "${#ai_review_paths[@]}" -gt 0 ]; then
+			ask_custom_instructions
+			run_dual_review_pipeline
+		else
+			printf '%sNo files selected for AI review.%s\n' "$YELLOW" "$RESET"
+			save_local_review_report
+		fi
+	else
+		save_local_review_report
+	fi
+fi
