@@ -1,4 +1,4 @@
-# 🤝 codex-claude-toolkit
+# 🤝 Codex Claude Toolkit
 
 [![](https://img.shields.io/badge/MIT-License-0f73b4.svg)](./LICENSE.md) [![](https://img.shields.io/badge/shell-bash-0f73b4.svg)](https://www.gnu.org/software/bash/) [![](https://img.shields.io/badge/docs-guide-0f73b4.svg)](./DOCS.md)
 
